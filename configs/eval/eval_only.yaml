@@ -14,3 +14,21 @@ task_id: -1  # if task_id is specified, it will only evaluate on that task
 
 n_eval: 20
 num_workers: ${n_eval}
+
+# --- runtime specification selection and log-likelihood recording ---
+# Comma-separated candidate specification sets scored at every step, e.g.
+# "gl,gl_inst,vid". The first acts; the rest are scored on the acted action.
+# null keeps the published single-specification behaviour.
+eval_modality_set:
+modality_delivery: bank   # bank | reembed
+record_logprobs: False
+record_logprobs_dir:      # null -> <experiment_dir>/logprobs
+record_actions: False
+
+# Live wandb view over the recorded log-likelihoods. The NDJSON stays the source
+# of truth; wandb gets per-(task,modality) summaries, a few per-step traces, and
+# the NDJSON as a run artifact.
+record_wandb: False
+wandb_project: mutex-pmi
+wandb_mode: online        # online | offline | disabled
+wandb_trace_episodes: 2   # per-step traces logged for episodes 0..N-1 only

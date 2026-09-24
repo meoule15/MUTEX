@@ -106,6 +106,12 @@ class MLMTaskDataset(SequenceVLDataset):
         self.mask_ai=cfg.policy.add_maim
         self.task_spec_modalities = cfg.policy.task_spec_modalities
 
+        ## Offline scoring needs to know which specification variant produced a row.
+        ## By default each modality still draws its own random variant, exactly as
+        ## during training; set_task_spec_id pins all of them to the same index.
+        self.fixed_task_spec_id = None
+        self.deterministic_frames = False
+
         if self.mask_inst and self.inst_tokens is not None:
             self.mim_sample_indices = []
             for task_spec_id, inst_token in enumerate(self.inst_tokens['input_ids']): # number of possible instructions
@@ -133,6 +139,15 @@ class MLMTaskDataset(SequenceVLDataset):
         self.cfg = cfg
         super().__init__(sequence_dataset, task_embs)
 
+    def set_task_spec_id(self, spec_id):
+        """Pin every modality to one specification variant (None restores sampling)."""
+        self.fixed_task_spec_id = spec_id
+
+    def _pick_spec_id(self, num_specs):
+        if self.fixed_task_spec_id is not None:
+            return self.fixed_task_spec_id % num_specs
+        return random.randint(0, num_specs-1)  # sample inclusive
+
     def __len__(self):
         return len(self.sequence_dataset)
 
@@ -140,15 +155,15 @@ class MLMTaskDataset(SequenceVLDataset):
         visual_dict = {}
         ## add all the visual specifications
         if 'vid' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.visual_spec['vid_task_spec'])-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.visual_spec['vid_task_spec']))
             vid_task_spec = self.visual_spec['vid_task_spec'][task_spec_id].clone()
             vid_task_spec_mask = self.visual_spec['vid_task_spec_mask'][task_spec_id].clone()
 
             frame_idx = sample_frames(
                             num_frames=min(self.t-1, vid_task_spec.shape[0]-1),
                             vlen=vid_task_spec.shape[0]-1,
-                            sample='rand' ## TODO: Make this rand
-            ) ## should be 'rand' or 'uniform'
+                            sample='uniform' if self.deterministic_frames else 'rand'
+            ) ## 'uniform' matches eval.py; 'rand' is the training default
             frame_idx.append(vid_task_spec.shape[0]-1) ## add the last frame
             vid_spec = vid_task_spec[frame_idx]
             vid_spec_mask = vid_task_spec_mask[frame_idx]
@@ -166,7 +181,7 @@ class MLMTaskDataset(SequenceVLDataset):
             visual_dict['gt_vid_spec'] = gt_vid_spec[mfm_indices]
 
         if 'img' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.visual_spec['img_task_spec'])-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.visual_spec['img_task_spec']))
             # don't clone here, since it is a very big tensor
             img_spec = self.visual_spec['img_task_spec'][task_spec_id] #.clone() ## [1, 50, 768]: Specifies the final goal
             #img_spec_mask = self.visual_spec['img_task_spec_mask'][task_spec_id].clone() # [1,50]
@@ -192,7 +207,7 @@ class MLMTaskDataset(SequenceVLDataset):
     def generate_language_specifications(self):
         return_dict = {}
         if 'inst' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.inst_tokens['input_ids'])-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.inst_tokens['input_ids']))
             input_ids = self.inst_tokens['input_ids'][task_spec_id].clone()
             gt_ids = self.inst_tokens['input_ids'][task_spec_id].clone()
             attention_mask = self.inst_tokens['attention_mask'][task_spec_id].clone()  ## don't make changes in the original task tokens
@@ -224,7 +239,7 @@ class MLMTaskDataset(SequenceVLDataset):
             return_dict['inst_emb_mask'] = torch.ones(return_dict['inst_tokens']['attention_mask'].shape[:-1])
 
         if 'gl' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.gl_emb)-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.gl_emb))
             if self.gl_tokens is None:
                 return_dict["gl_emb"] = self.gl_emb[task_spec_id] ## adding time dimension
                 # add time dimension if not present
@@ -256,7 +271,7 @@ class MLMTaskDataset(SequenceVLDataset):
     def generate_audio_specification(self):
         audio_dict = {}
         if 'ai' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.ai_task_spec['ai_task_spec'])-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.ai_task_spec['ai_task_spec']))
             ai_spec = self.ai_task_spec['ai_task_spec'][task_spec_id].clone()
             ai_spec_mask = self.ai_task_spec['ai_task_spec_mask'][task_spec_id].clone()
             gt_ai_spec = self.ai_task_spec['ai_task_spec'][task_spec_id].clone()
@@ -273,7 +288,7 @@ class MLMTaskDataset(SequenceVLDataset):
             audio_dict['maim_indices'] = torch.Tensor(maim_indices).long()
             audio_dict['gt_ai_spec'] = gt_ai_spec[maim_indices]
         if 'ag' in self.task_spec_modalities:
-            task_spec_id = random.randint(0, len(self.ag_task_spec['ag_task_spec'])-1)  # sample inclusive
+            task_spec_id = self._pick_spec_id(len(self.ag_task_spec['ag_task_spec']))
             ag_spec = self.ag_task_spec['ag_task_spec'][task_spec_id].clone()
             ag_spec_mask = self.ag_task_spec['ag_task_spec_mask'][task_spec_id].clone()
             gt_ag_spec = self.ag_task_spec['ag_task_spec'][task_spec_id].clone()

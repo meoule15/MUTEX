@@ -1,6 +1,7 @@
 import gc
 import copy
 import gc
+from collections import OrderedDict
 import cv2
 import imageio
 import numpy as np
@@ -21,17 +22,24 @@ from libero.libero.envs import OffScreenRenderEnv, SubprocVectorEnv
 from mutex.utils import *
 
 
+def _expand_task_emb(task_emb, env_num):
+    """Broadcast one task embedding across the parallel envs."""
+    if len(task_emb.shape) == 1: ## adds a new dimension and repeats along it
+        return task_emb.repeat(env_num, 1)
+    elif len(task_emb.shape) == 2:
+        return task_emb.repeat(env_num, 1, 1)
+    elif len(task_emb.shape) == 3 and task_emb.shape[0] == env_num:
+        return task_emb ## already one embedding per env
+    else:
+        raise NotImplementedError
+
+
 def raw_obs_to_tensor_obs(obs, task_emb, cfg):
     """
         Prepare the tensor observations as input for the algorithm.
     """
     env_num = len(obs)
-    if len(task_emb.shape) == 1: ## adds a new dimension and repeats along it
-        task_emb = task_emb.repeat(env_num, 1)
-    elif len(task_emb.shape) == 2:
-        task_emb = task_emb.repeat(env_num, 1, 1)
-    else:
-        raise NotImplementedError
+    task_emb = _expand_task_emb(task_emb, env_num)
 
     data = {
         "obs": {
@@ -74,12 +82,20 @@ def evaluate_one_task_success(
                         task_id,
                         sim_states=None,
                         task_str="",
+                        spec_provider=None,
+                        recorder=None,
+                        spec_modalities=None,
     ):
     """
         Evaluate a single task's success rate
         sim_states: if not None, will keep track of all simulated states during
                     evaluation, mainly for visualization and debugging purpose
         task_str:   the key to access sim_states dictionary
+        spec_provider:   if not None, a TaskSpecProvider supplying task embeddings
+                    per step instead of the fixed `task_emb`
+        recorder:   if not None, a LogProbRecorder receiving the log-likelihood of
+                    each executed action under every scored specification
+        spec_modalities: modality keys to score when spec_provider is given
     """
 
     t0 = time.time()
@@ -127,8 +143,18 @@ def evaluate_one_task_success(
         for _ in range(5):
             obs, _, _, _ = env.step(dummy)
 
-        for k in range(env_num):
-            task_emb_eval = task_emb[(i*env_num+k) % task_emb.shape[0]]
+        episode_offset = i * env_num
+        if spec_provider is None:
+            ## Unchanged published path. Note only the last k survives this loop;
+            ## inert at the shipped use_mp=False, where env_num == 1.
+            for k in range(env_num):
+                task_emb_eval = task_emb[(episode_offset+k) % task_emb.shape[0]]
+            spec_indices = None
+        else:
+            ## With a provider the specification is indexed explicitly per env.
+            n_specs = spec_provider.num_specs(task_id, spec_modalities[0])
+            spec_indices = [(episode_offset+k) % n_specs for k in range(env_num)]
+            task_emb_eval = None
 
         if task_str != "":
             sim_state = env.get_sim_state()
@@ -140,9 +166,48 @@ def evaluate_one_task_success(
             steps += 1
 
             if env_num == 1: obs = [obs]
-            data = raw_obs_to_tensor_obs(obs, task_emb_eval, cfg)
 
-            actions = algo.policy.get_action(data)
+            if spec_provider is None and recorder is None:
+                ## Unchanged published path.
+                data = raw_obs_to_tensor_obs(obs, task_emb_eval, cfg)
+                actions = algo.policy.get_action(data)
+            else:
+                if spec_provider is not None:
+                    task_embs = OrderedDict(
+                            (key, torch.stack([spec_provider.get(task_id, key, s)
+                                               for s in spec_indices], dim=0))
+                            for key in spec_modalities)
+                    acting_key = spec_modalities[0]
+                    data = raw_obs_to_tensor_obs(obs, task_embs[acting_key], cfg)
+                    dists = algo.policy.get_action_dists(data, task_embs)
+                else:
+                    data = raw_obs_to_tensor_obs(obs, task_emb_eval, cfg)
+                    acting_key = '_'.join(algo.policy.task_spec_modalities)
+                    _, dist = algo.policy.get_action(data, return_dist=True)
+                    dists = OrderedDict([(acting_key, dist)])
+
+                ## One executed action, scored under every candidate specification,
+                ## so rows for the same (episode, step) are directly comparable.
+                act_t = dists[acting_key].sample().detach()
+                if recorder is not None:
+                    for key, dist in dists.items():
+                        logp = dist.log_prob(act_t)
+                        for k in range(env_num):
+                            episode = episode_offset + k
+                            if episode >= cfg.eval.n_eval:
+                                continue
+                            recorder.record(
+                                    logp=logp[k],
+                                    actions=act_t[k],
+                                    modality=key,
+                                    spec_index=None if spec_indices is None else spec_indices[k],
+                                    episode=episode,
+                                    env_index=k,
+                                    step=steps,
+                                    action_source='sampled')
+                actions = act_t.cpu()
+                actions = actions.view(actions.shape[0], -1).numpy()
+
             if env_num == 1: actions = actions[0]
 
             obs, reward, done, info = env.step(actions)
@@ -198,7 +263,8 @@ def evaluate_success(cfg, algo, benchmark, task_ids, result_summary=None):
     return np.array(successes)
 
 
-def evaluate_multitask_training_success(cfg, algo, benchmark, task_ids, result_summary=None):
+def evaluate_multitask_training_success(cfg, algo, benchmark, task_ids, result_summary=None,
+                                        spec_provider=None, recorder=None, spec_modalities=None):
     """
         Evaluate the success rate for all task in task_ids.
     """
@@ -212,13 +278,19 @@ def evaluate_multitask_training_success(cfg, algo, benchmark, task_ids, result_s
         for eval_traj_i in range(cfg.eval.n_eval):
             curr_summary[eval_traj_i] = []
 
+        if recorder is not None:
+            recorder.set_context(task_id=i, task_name=task_i.name)
+
         success_rate, curr_summary = evaluate_one_task_success(cfg=cfg,
                                                  algo=algo,
                                                  task=task_i,
                                                  task_emb=task_emb,
                                                  task_id=i,
                                                  task_str=task_str,
-                                                 sim_states=curr_summary)
+                                                 sim_states=curr_summary,
+                                                 spec_provider=spec_provider,
+                                                 recorder=recorder,
+                                                 spec_modalities=spec_modalities)
         successes.append(success_rate)
         print(f"Task {task_i.name}; Success Rate: {success_rate}")
         result_summary[i].update({'sim_states': copy.deepcopy(curr_summary)})

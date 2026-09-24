@@ -1,5 +1,7 @@
 import copy
 import random
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,6 +23,20 @@ from mutex.models.transformer import *
 from mutex.models.mlm_head import MFMHead, MRMHead, MIMHead, MGMHead, \
         MAIMHead, MAGMHead, MRMHead_L1, MFMHead_L1, MAIMHead_L1, MAGMHead_L1
 from mutex.models.task_specs import CLIPVisionSliced
+
+def resolve_modalities(modalities, default):
+    """Normalise a task-specification modality selector to a list of keys.
+
+    Accepts None (fall back to ``default``), an underscore-joined string such as
+    ``"gl_inst"``, or an iterable of keys. Kept at module level so it can be
+    unit-tested without constructing a policy.
+    """
+    if modalities is None:
+        return list(default)
+    if isinstance(modalities, str):
+        return modalities.split('_')
+    return list(modalities)
+
 
 ###############################################################################
 #
@@ -262,9 +278,16 @@ class BCMutexPolicy(BasePolicy):
             self.tz = AutoTokenizer.from_pretrained(cfg.lang_tokenizer, cache_dir=to_absolute_path("./bert"))
 
         self.log_info = {}
+        ## Optional sink for raw action log-likelihoods; see mutex/logprob_recorder.py.
+        ## None means no recording and no overhead.
+        self._lp_recorder = None
         # For evaluation to reuse
         self.latent_queue = []
         self.max_seq_len = policy_cfg.transformer_max_seq_len
+
+    def set_logprob_recorder(self, recorder):
+        """Attach (or detach, with None) a LogProbRecorder."""
+        self._lp_recorder = recorder
 
     def train(self, mode=True):
         if not isinstance(mode, bool):
@@ -292,9 +315,11 @@ class BCMutexPolicy(BasePolicy):
             self.magm_head.anneal_weights(epoch)
 
     def get_task_embs(self, data, modalities=None):
-        if modalities is None:
-            modalities = self.task_spec_modalities ## IF not passed explicitly, pick all modalities
-        num_modalities = len(self.task_spec_modalities)
+        ## Callers may pass None (use the configured set), an underscore-joined
+        ## string such as "gl_inst" (what eval.py passes), or an explicit list.
+        ## Normalising first is what keeps num_modalities below correct: len()
+        ## of the raw string would count characters, not modalities.
+        modalities = resolve_modalities(modalities, self.task_spec_modalities)
         if self.training:
             num_modalities = random.randint(1, len(modalities))
             selected_modalities = random.sample(modalities, num_modalities)
@@ -305,6 +330,7 @@ class BCMutexPolicy(BasePolicy):
                 if (num_modalities > 1) or (selected_modalities[0] != 'vid'):
                     break
             modalities = selected_modalities
+        num_modalities = len(modalities)
 
         inst_emb, gl_emb, img_emb, vid_emb, ag_emb, ai_emb = None, None, None, None, None, None
         inst_emb_mask, gl_emb_mask, img_emb_mask, vid_emb_mask, ag_emb_mask, ai_emb_mask = None, None, None, None, None, None
@@ -413,9 +439,9 @@ class BCMutexPolicy(BasePolicy):
         encoded = torch.cat(encoded, -2) # (B, T, num_modalities, E)
         return encoded
 
-    def forward(self, data, reduction='mean'):
+    def forward(self, data, reduction='mean', modalities=None):
         data = self.process_input(data, train_mode=True) ## Even for validation keep train_mode=True
-        data["task_emb"], data["task_emb_mask"], inp_modalities, rep_dict = self.get_task_embs(data)
+        data["task_emb"], data["task_emb_mask"], inp_modalities, rep_dict = self.get_task_embs(data, modalities=modalities)
         x = self.spatial_encode(data)
         x = self.temporal_encode(x, context_tokens=data['task_emb'], context_tokens_mask=data['task_emb_mask'])
 
@@ -446,6 +472,18 @@ class BCMutexPolicy(BasePolicy):
         loss = 0.0
         bc_loss = self.policy_head.loss_fn(dist, data["actions"], reduction)
         loss += bc_loss
+
+        ## Raw log-likelihoods for offline scoring. Deliberately a separate
+        ## log_prob call rather than reusing bc_loss: loss_fn negates and scales
+        ## by loss_coef, and folding the two would perturb the training loss by
+        ## float rounding.
+        if self._lp_recorder is not None:
+            with torch.no_grad():
+                self._lp_recorder.record(
+                        logp=dist.log_prob(data["actions"]),
+                        actions=data["actions"],
+                        modality='_'.join(inp_modalities),
+                        action_source='ground_truth')
 
         self.log_info['bc_loss'] = bc_loss.item()
         if self.debug:
@@ -536,28 +574,61 @@ class BCMutexPolicy(BasePolicy):
 
         return loss
 
-    def get_action(self, data):
+    def get_action(self, data, return_dist=False):
         self.eval()
         with torch.no_grad():
-            data = self.process_input(data, train_mode=False)
-            x = self.spatial_encode(data)
-            self.latent_queue.append(x)
-            if len(self.latent_queue) > self.max_seq_len:
-                self.latent_queue.pop(0)
-            x = torch.cat(self.latent_queue, dim=1) # (B, T, H_all)
-            x = self.temporal_encode(x, context_tokens=data['task_emb'])
-            ### the decoder
-            q_x, cross_attn_mask, self_attn_mask, query_meta = self.decoder.get_query_vec(
-                        num_input_tokens=x.shape[1],
-                        batch_size=x.shape[0],
-                        lang_q_ind=[],
-                        action_q_ind=x.shape[0]*[[i for i in range(x.shape[1])]],
-            )
-            x = self.decoder(inputs=x, query_vecs=q_x, cross_attn_mask=cross_attn_mask, self_attn_mask=self_attn_mask)
-            ###
-            dist = self.policy_head(x[:,-1])
+            x = self._encode_obs_step(data)
+            dist = self._action_dist_from_latents(x, data['task_emb'])
         action = dist.sample().detach().cpu()
-        return action.view(action.shape[0], -1).numpy()
+        action = action.view(action.shape[0], -1).numpy()
+        if return_dist:
+            return action, dist
+        return action
+
+    def _encode_obs_step(self, data):
+        """Encode one observation step and advance the latent queue EXACTLY once.
+
+        Split out of get_action so several task specifications can be scored at
+        the same env step without double-advancing the history.
+        """
+        data = self.process_input(data, train_mode=False)
+        x = self.spatial_encode(data)
+        self.latent_queue.append(x)
+        if len(self.latent_queue) > self.max_seq_len:
+            self.latent_queue.pop(0)
+        return torch.cat(self.latent_queue, dim=1) # (B, T, H_all)
+
+    def _action_dist_from_latents(self, x, task_emb):
+        """Second half of get_action: latents + task embedding -> action distribution."""
+        x = self.temporal_encode(x, context_tokens=task_emb)
+        ### the decoder
+        q_x, cross_attn_mask, self_attn_mask, query_meta = self.decoder.get_query_vec(
+                    num_input_tokens=x.shape[1],
+                    batch_size=x.shape[0],
+                    lang_q_ind=[],
+                    action_q_ind=x.shape[0]*[[i for i in range(x.shape[1])]],
+        )
+        x = self.decoder(inputs=x, query_vecs=q_x, cross_attn_mask=cross_attn_mask, self_attn_mask=self_attn_mask)
+        ###
+        return self.policy_head(x[:,-1])
+
+    def get_action_dists(self, data, task_embs):
+        """Action distributions for several task specifications at one env step.
+
+        task_embs: mapping of modality key -> task embedding, each already shaped
+        [B, T, E]. Passed separately from `data` on purpose: process_input adds a
+        time dimension to every tensor it finds in `data`, which would corrupt them.
+
+        The observation encoders run once; only the temporal encoder, decoder and
+        policy head re-run per specification.
+        """
+        self.eval()
+        dists = OrderedDict()
+        with torch.no_grad():
+            x = self._encode_obs_step(data)
+            for key, task_emb in task_embs.items():
+                dists[key] = self._action_dist_from_latents(x, task_emb)
+        return dists
 
     def reset(self):
         self.latent_queue = []

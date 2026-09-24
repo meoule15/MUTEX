@@ -22,6 +22,8 @@ from mutex.utils import control_seed, safe_device, torch_load_model, \
                         make_dir, confidence_interval
 from mutex.embed_utils import get_visual_specifications_all, \
                         get_task_embs, get_audio_specification
+from mutex.logprob_recorder import LogProbRecorder, WandbLogProbSink
+from mutex.task_spec_provider import TaskSpecProvider, build_spec_data_dict
 
 class EvalLogger:
     def __init__(self, log_keys: list):
@@ -73,55 +75,33 @@ def summary2video(task_ind, task_i, result_summary, eval_cfg, cfg):
     import gc; gc.collect()
     return
 
+def parse_modality_sets(value):
+    """Normalise the eval_modality_set option to a list of specification keys.
+
+    Hydra reads a bare comma-separated override as a list, so accept both:
+        eval_modality_set=[gl,gl_inst,vid]     -> list
+        eval_modality_set='"gl,gl_inst,vid"'   -> string
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = value.split(',')
+    else:
+        items = list(value)
+    return [str(s).strip() for s in items if str(s).strip()]
+
+
 def bm_set_task_embs(algo, benchmark, eval_spec_modalities, task_range, device):
     new_task_embs = []
     for i in task_range:
-        data_dict = {}
-
-        visual_spec = benchmark.get_visual_task_specification(i)
-        if 'vid' in eval_spec_modalities:
-            vid_spec_list, vid_spec_mask_list = [], []
-            for idx in range(len(visual_spec['vid_task_spec'])):
-                vid_task_spec = visual_spec['vid_task_spec'][idx]
-                vid_task_spec_mask = visual_spec['vid_task_spec_mask'][idx]
-                frame_idx = sample_frames(num_frames=min(algo.cfg.policy.num_task_frames-1, vid_task_spec.shape[0]-1), vlen=vid_task_spec.shape[0]-1, sample='uniform') ## uniform sampling for evaluation
-                frame_idx.append(vid_task_spec.shape[0]-1)
-
-                vid_spec=vid_task_spec[frame_idx].to(device)
-                vid_spec_mask=vid_task_spec_mask[frame_idx].to(device)
-                vid_spec_list.append(vid_spec)
-                vid_spec_mask_list.append(vid_spec_mask)
-            data_dict['vid_spec'] = torch.stack(vid_spec_list,dim=0)  # [num_eval_ts,num_frames,E]
-            data_dict['vid_spec_mask'] = torch.stack(vid_spec_mask_list, dim=0)
-
-        if 'img' in eval_spec_modalities:
-            data_dict['img_spec'] = torch.stack(visual_spec['img_task_spec'], dim=0).to(device)
-            img_spec_mask = None
-            data_dict['img_spec_mask'] = img_spec_mask
-
-        if 'inst' in eval_spec_modalities:
-            inst_emb = benchmark.get_inst_emb(i)
-            inst_token = benchmark.get_inst_token(i)
-            data_dict['inst_emb'] = inst_emb.to(device)
-
-            input_mask = torch.ones(data_dict['inst_emb'].shape[:-1])
-            input_mask = input_mask.to(device)
-            data_dict['inst_emb_mask'] = input_mask
-
-        if 'gl' in eval_spec_modalities:
-            gl_emb = benchmark.get_gl_emb(i)
-            ## adding time dimension
-            data_dict['gl_emb'] = gl_emb.unsqueeze(dim=1).to(device)
-
-        if 'ai' in eval_spec_modalities:
-            ai_task_spec = benchmark.get_ai_task_spec(i)
-            data_dict['ai_task_spec'] = ai_task_spec['ai_task_spec'].to(device)
-            data_dict['ai_task_spec_mask'] = ai_task_spec['ai_task_spec_mask'].to(device)
-
-        if 'ag' in eval_spec_modalities:
-            ag_task_spec = benchmark.get_ag_task_spec(i)
-            data_dict['ag_task_spec'] = ag_task_spec['ag_task_spec'].to(device)
-            data_dict['ag_task_spec_mask'] = ag_task_spec['ag_task_spec_mask'].to(device)
+        ## Body extracted to mutex.task_spec_provider.build_spec_data_dict so the
+        ## runtime provider encodes from byte-identical inputs.
+        data_dict = build_spec_data_dict(
+                benchmark=benchmark,
+                task_id=i,
+                modalities=eval_spec_modalities,
+                device=device,
+                num_task_frames=algo.cfg.policy.num_task_frames)
 
         emb, *temp = algo.policy.get_task_embs(data_dict, modalities=eval_spec_modalities)
         new_task_embs.append(emb)
@@ -173,11 +153,40 @@ def main(eval_cfg):
         cfg.policy.projection_layer.network_kwargs.ag_transform_kwargs.network_kwargs.add_cross_modal_layer = True
         cfg.policy.projection_layer.network_kwargs.img_transform_kwargs.network_kwargs.add_cross_modal_layer = True
 
-    if eval_cfg.eval_spec_modalities is not None:
-        assert all([task_spec in cfg.policy.task_spec_modalities.split('_') for task_spec in eval_cfg.eval_spec_modalities.split('_')])
-        cfg.policy.task_spec_modalities = eval_cfg.eval_spec_modalities
+    ## Runtime specification selection / recording. Defaults leave every path below
+    ## exactly as published.
+    cfg.eval_modality_set = getattr(eval_cfg, 'eval_modality_set', None)
+    cfg.modality_delivery = getattr(eval_cfg, 'modality_delivery', 'bank')
+    cfg.record_logprobs = getattr(eval_cfg, 'record_logprobs', False)
+    cfg.record_actions = getattr(eval_cfg, 'record_actions', False)
+    cfg.record_wandb = getattr(eval_cfg, 'record_wandb', False)
+    cfg.wandb_eval_project = getattr(eval_cfg, 'wandb_project', 'mutex-pmi')
+    cfg.wandb_eval_mode = getattr(eval_cfg, 'wandb_mode', 'online')
+    cfg.wandb_trace_episodes = getattr(eval_cfg, 'wandb_trace_episodes', 2)
+    cfg.record_logprobs_dir = getattr(eval_cfg, 'record_logprobs_dir', None) \
+            or os.path.join(eval_cfg.experiment_dir, "logprobs")
 
-    prefix = cfg.policy.task_spec_modalities + '_'
+    if cfg.eval_modality_set is not None:
+        ## The candidate sets are selected per call at runtime, so the policy is
+        ## constructed with their union: task_spec_modalities becomes the superset
+        ## available, not the selection. Canonical ordering keeps cache filenames stable.
+        ## Accepts either Hydra list form  eval_modality_set=[gl,gl_inst,vid]
+        ## or quoted string form          eval_modality_set='"gl,gl_inst,vid"'
+        cfg.eval_modality_sets = parse_modality_sets(cfg.eval_modality_set)
+        canonical = cfg.policy.task_spec_modalities.split('_')
+        requested = {m for s in cfg.eval_modality_sets for m in s.split('_')}
+        assert requested <= set(canonical), \
+                f"unknown modalities {requested - set(canonical)}; policy provides {canonical}"
+        cfg.policy.task_spec_modalities = '_'.join(m for m in canonical if m in requested)
+        cfg.eval_run_tag = 'set-' + '+'.join(cfg.eval_modality_sets)
+    else:
+        cfg.eval_modality_sets = None
+        if eval_cfg.eval_spec_modalities is not None:
+            assert all([task_spec in cfg.policy.task_spec_modalities.split('_') for task_spec in eval_cfg.eval_spec_modalities.split('_')])
+            cfg.policy.task_spec_modalities = eval_cfg.eval_spec_modalities
+        cfg.eval_run_tag = cfg.policy.task_spec_modalities
+
+    prefix = cfg.eval_run_tag + '_'
     if eval_cfg.task_id == -1:
         cfg.eval_csv_filename = os.path.join(eval_cfg.experiment_dir, \
                 f"{cfg.benchmark_name}_{prefix}eval_data_ts_{eval_cfg.ts_mode}_{eval_cfg.model_name}.csv")
@@ -304,6 +313,48 @@ def main(eval_cfg):
 
         algo.eval()
         t0 = time.time()
+
+        ## Runtime specification selection, off unless eval_modality_set is given.
+        spec_provider, spec_modalities = None, None
+        if cfg.eval_modality_sets is not None:
+            spec_modalities = cfg.eval_modality_sets
+            spec_provider = TaskSpecProvider(
+                    benchmark=benchmark,
+                    policy=algo.policy,
+                    device=cfg.device,
+                    num_task_frames=cfg.policy.num_task_frames,
+                    mode=cfg.modality_delivery)
+            if spec_provider.mode == TaskSpecProvider.BANK:
+                spec_provider.prepare(range(n_manip_tasks), spec_modalities)
+
+        ## Raw log-likelihood recording, off unless record_logprobs is set.
+        recorder = None
+        if cfg.record_logprobs:
+            run_tag = f"{cfg.benchmark_name}_{prefix}ts_{eval_cfg.ts_mode}_{eval_cfg.model_name}"
+            wandb_sink = None
+            if cfg.record_wandb:
+                wandb_sink = WandbLogProbSink(
+                        project=cfg.wandb_eval_project,
+                        run_name=run_tag,
+                        mode=cfg.wandb_eval_mode,
+                        dir=eval_cfg.experiment_dir,
+                        config={'benchmark': cfg.benchmark_name,
+                                'modality_sets': cfg.eval_modality_sets,
+                                'modality_delivery': cfg.modality_delivery,
+                                'ts_mode': eval_cfg.ts_mode,
+                                'model_name': eval_cfg.model_name,
+                                'n_eval': cfg.eval.n_eval},
+                        trace_episodes=cfg.wandb_trace_episodes)
+            recorder = LogProbRecorder(
+                    out_path=os.path.join(cfg.record_logprobs_dir, f"{run_tag}.jsonl"),
+                    store_actions=cfg.record_actions,
+                    sink=wandb_sink)
+            recorder.set_context(
+                    run_id=f"{int(time.time())}_{os.getpid()}",
+                    ckpt=eval_cfg.model_name,
+                    source='rollout',
+                    ts_mode=eval_cfg.ts_mode)
+
         with torch.no_grad():
             task_embs = bm_set_task_embs(
                                 algo=algo,
@@ -316,7 +367,13 @@ def main(eval_cfg):
                                                                 algo=algo,
                                                                 benchmark=benchmark,
                                                                 task_ids=all_tasks,
-                                                                result_summary=result_summary)
+                                                                result_summary=result_summary,
+                                                                spec_provider=spec_provider,
+                                                                recorder=recorder,
+                                                                spec_modalities=spec_modalities)
+            if recorder is not None:
+                recorder.close()
+                print(f"[info] wrote {recorder.n_written} log-prob rows to {recorder.out_path}")
             for index, task_id in enumerate(all_tasks):
                 task_i = benchmark.get_task(task_id).name
                 eval_logger.add_kv(f"{task_i}", success_rates[index])

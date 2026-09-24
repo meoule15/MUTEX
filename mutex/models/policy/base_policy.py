@@ -66,7 +66,8 @@ class BasePolicy(nn.Module):
             data = TensorUtils.recursive_dict_list_tuple_apply(data, {
                 torch.Tensor: lambda x: x.unsqueeze(dim=1) # add time dimension
             })
-            data["task_emb"] = data["task_emb"].squeeze(1)
+            if "task_emb" in data: # may be absent when only encoding observations
+                data["task_emb"] = data["task_emb"].squeeze(1)
         return data
 
     def get_loss(self, data, reduction='mean'):

@@ -17,3 +17,4 @@ src/*
 temp/*
 *.egg-info/*
 *_exps/*
+build/
