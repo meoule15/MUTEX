@@ -18,3 +18,4 @@ temp/*
 *.egg-info/*
 *_exps/*
 build/
+mutex_pretrained/models/*.pth

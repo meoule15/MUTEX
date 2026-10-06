@@ -122,6 +122,8 @@ def main(eval_cfg):
     pp.pprint(cfg)
 
     # control seed
+    if getattr(eval_cfg, 'seed', None) is not None:
+        cfg.seed = eval_cfg.seed
     control_seed(cfg.seed)
 
     # prepare multitask learning. Overriding from eval_cfg because train and test could be in different machines
@@ -159,6 +161,24 @@ def main(eval_cfg):
     cfg.modality_delivery = getattr(eval_cfg, 'modality_delivery', 'bank')
     cfg.record_logprobs = getattr(eval_cfg, 'record_logprobs', False)
     cfg.record_actions = getattr(eval_cfg, 'record_actions', False)
+    cfg.record_pmi = getattr(eval_cfg, 'record_pmi', False)
+    cfg.pmi_samples = getattr(eval_cfg, 'pmi_samples', 32)
+    cfg.spec_selection = getattr(eval_cfg, 'spec_selection', 'fixed')
+    cfg.selection_interval = getattr(eval_cfg, 'selection_interval', 10)
+    cfg.selection_margin = getattr(eval_cfg, 'selection_margin', 0.5)
+    cfg.selection_uncertainty = getattr(eval_cfg, 'selection_uncertainty', 2.0)
+    cfg.selection_initial_modality = getattr(eval_cfg,'selection_initial_modality',None)
+    if cfg.spec_selection not in ('fixed', 'expected_lift', 'random'):
+        raise ValueError('spec_selection must be fixed, expected_lift or random')
+    if cfg.spec_selection != 'fixed':
+        from mutex.pmi import SpecificationSelector
+        SpecificationSelector(['validation'], 1, cfg.selection_interval,
+                              cfg.selection_margin, cfg.selection_uncertainty)
+        cfg.record_pmi = True
+    if cfg.record_pmi:
+        if cfg.eval_modality_set is None or cfg.pmi_samples < 2:
+            raise ValueError('record_pmi requires eval_modality_set and pmi_samples >= 2')
+        cfg.record_logprobs = True
     cfg.record_wandb = getattr(eval_cfg, 'record_wandb', False)
     cfg.wandb_eval_project = getattr(eval_cfg, 'wandb_project', 'mutex-pmi')
     cfg.wandb_eval_mode = getattr(eval_cfg, 'wandb_mode', 'online')
@@ -186,6 +206,8 @@ def main(eval_cfg):
             cfg.policy.task_spec_modalities = eval_cfg.eval_spec_modalities
         cfg.eval_run_tag = cfg.policy.task_spec_modalities
 
+    if cfg.spec_selection != 'fixed':
+        cfg.eval_run_tag += '-select-' + cfg.spec_selection
     prefix = cfg.eval_run_tag + '_'
     if eval_cfg.task_id == -1:
         cfg.eval_csv_filename = os.path.join(eval_cfg.experiment_dir, \

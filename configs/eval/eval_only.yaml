@@ -11,6 +11,7 @@ bddl_folder: "LIBERO/libero/libero/bddl_files/"
 init_states_folder: "LIBERO/libero/libero/init_files/"
 eval_spec_modalities:
 task_id: -1  # if task_id is specified, it will only evaluate on that task
+seed:        # null preserves checkpoint seed
 
 n_eval: 20
 num_workers: ${n_eval}
@@ -24,6 +25,13 @@ modality_delivery: bank   # bank | reembed
 record_logprobs: False
 record_logprobs_dir:      # null -> <experiment_dir>/logprobs
 record_actions: False
+record_pmi: False         # requires eval_modality_set; paired blank references
+pmi_samples: 32           # Monte Carlo expected lift and entropy
+spec_selection: fixed    # fixed | expected_lift (experimental) | random
+selection_interval: 10
+selection_margin: 0.5
+selection_uncertainty: 2.0
+selection_initial_modality:  # null -> first candidate; retained when rankings abstain
 
 # Live wandb view over the recorded log-likelihoods. The NDJSON stays the source
 # of truth; wandb gets per-(task,modality) summaries, a few per-step traces, and

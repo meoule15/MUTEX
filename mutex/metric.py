@@ -12,6 +12,7 @@ import time
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from mutex.pmi import action_lift, expected_lift, SpecificationSelector, RandomSpecificationSelector
 from robosuite import load_controller_config
 from time import gmtime, strftime
 from torch.multiprocessing import Array
@@ -162,6 +163,15 @@ def evaluate_one_task_success(
                 if i*env_num+k < cfg.eval.n_eval:
                     sim_states[i*env_num+k].append(sim_state if env_num == 1 else sim_state[k])
 
+        selector = None
+        if getattr(cfg, 'spec_selection', 'fixed') == 'expected_lift':
+            selector = SpecificationSelector(spec_modalities, env_num,
+                        cfg.selection_interval, cfg.selection_margin, cfg.selection_uncertainty,
+                        initial_key=getattr(cfg,'selection_initial_modality',None))
+        elif getattr(cfg, 'spec_selection', 'fixed') == 'random':
+            selector = RandomSpecificationSelector(spec_modalities, env_num,
+                                                   cfg.selection_interval, cfg.seed + episode_offset)
+
         while steps < cfg.eval.max_steps:
             steps += 1
 
@@ -179,6 +189,11 @@ def evaluate_one_task_success(
                             for key in spec_modalities)
                     acting_key = spec_modalities[0]
                     data = raw_obs_to_tensor_obs(obs, task_embs[acting_key], cfg)
+                    if getattr(cfg, 'record_pmi', False):
+                        for key in spec_modalities:
+                            task_embs['blank:' + key] = torch.stack([
+                                spec_provider.get_blank(task_id, key, s)
+                                for s in spec_indices], dim=0)
                     dists = algo.policy.get_action_dists(data, task_embs)
                 else:
                     data = raw_obs_to_tensor_obs(obs, task_emb_eval, cfg)
@@ -188,10 +203,40 @@ def evaluate_one_task_success(
 
                 ## One executed action, scored under every candidate specification,
                 ## so rows for the same (episode, step) are directly comparable.
-                act_t = dists[acting_key].sample().detach()
+                selection_scores = {}
+                switched = [False] * env_num
+                if selector is not None:
+                    if selector.due(steps) and cfg.spec_selection == 'expected_lift':
+                        devices = [torch.device(cfg.device).index or 0] if str(cfg.device).startswith('cuda') else []
+                        with torch.random.fork_rng(devices=devices):
+                            for key in spec_modalities:
+                                selection_scores[key] = expected_lift(
+                                    dists[key], [dists['blank:' + key]], cfg.pmi_samples)
+                        switched = selector.update(steps, selection_scores)
+                    elif selector.due(steps):
+                        switched = selector.update(steps)
+                    selected = selector.current
+                    sampled = {key: dists[key].sample().detach() for key in spec_modalities}
+                    act_t = torch.stack([sampled[key][k] for k, key in enumerate(selected)])
+                else:
+                    selected = [acting_key] * env_num
+                    act_t = dists[acting_key].sample().detach()
                 if recorder is not None:
                     for key, dist in dists.items():
+                        if key.startswith('blank:'):
+                            continue
                         logp = dist.log_prob(act_t)
+                        pmi = None
+                        if getattr(cfg, 'record_pmi', False):
+                            ref = dists['blank:' + key]
+                            pmi = action_lift(dist, [ref], act_t)
+                            # Diagnostic samples must not perturb the acting RNG.
+                            devices = [act_t.device.index] if act_t.is_cuda else []
+                            if key in selection_scores:
+                                pmi.update(selection_scores[key])
+                            else:
+                                with torch.random.fork_rng(devices=devices):
+                                    pmi.update(expected_lift(dist, [ref], cfg.pmi_samples))
                         for k in range(env_num):
                             episode = episode_offset + k
                             if episode >= cfg.eval.n_eval:
@@ -204,6 +249,24 @@ def evaluate_one_task_success(
                                     episode=episode,
                                     env_index=k,
                                     step=steps,
+                                    **({
+                                        'reference': 'blank',
+                                        'reference_logp': pmi['reference_logp'][k].item(),
+                                        'lift': pmi['lift'][k].item(),
+                                        'expected_lift': pmi['expected_lift'][k].item(),
+                                        'expected_lift_se': pmi['expected_lift_se'][k].item(),
+                                        'entropy': pmi['entropy'][k].item(),
+                                        'num_samples': cfg.pmi_samples,
+                                        'acting_modality': selected[k],
+                                        'spec_selection': getattr(cfg, 'spec_selection', 'fixed'),
+                                        'selection_decision': selector is not None and selector.due(steps),
+                                        'selection_switched': switched[k],
+                                        'selection_status': (selector.last_decisions[k]['status'] if
+                                            getattr(cfg,'spec_selection','fixed')=='expected_lift' and selector.due(steps) else None),
+                                        'selection_interval': getattr(cfg, 'selection_interval', None),
+                                        'selection_margin': getattr(cfg, 'selection_margin', None),
+                                        'selection_uncertainty': getattr(cfg, 'selection_uncertainty', None),
+                                    } if pmi is not None else {}),
                                     action_source='sampled')
                 actions = act_t.cpu()
                 actions = actions.view(actions.shape[0], -1).numpy()

@@ -153,6 +153,19 @@ class TaskSpecProvider:
         return OrderedDict(
                 (key, self.get(task_id, key, spec_index)) for key in modality_keys)
 
+    def get_blank(self, task_id, modality_key, spec_index):
+        """Encode zeroed content with the same modality and masks as the source."""
+        from mutex.pmi import blank_specification
+        cache_key = ('blank', task_id, modality_key, spec_index)
+        if cache_key not in self._cache:
+            data = build_spec_data_dict(self.benchmark, task_id, modality_key,
+                                        self.device, self.num_task_frames, spec_index)
+            with torch.no_grad():
+                emb, *_ = self.policy.get_task_embs(blank_specification(data),
+                                                   modalities=modality_key)
+            self._cache[cache_key] = emb[0].cpu()
+        return self._cache[cache_key].to(self.device)
+
     def num_specs(self, task_id, modality_key):
         key = (task_id, modality_key)
         if key not in self._store:

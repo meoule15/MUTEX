@@ -1,0 +1,405 @@
+{
+    "seed": 0,
+    "use_wandb": true,
+    "wandb_project": "multiple_ts_transform",
+    "wandb_mode": "online",
+    "folder": "/data/libero",
+    "bddl_folder": "/home/ubuntu/research/libero-dev/chiliocosm/bddl_files",
+    "init_states_folder": "/home/ubuntu/research/libero-dev/chiliocosm/init_files",
+    "ckpt_dir": null,
+    "load_previous_model": false,
+    "device": "cuda:0",
+    "visual_embedding_format": "clip",
+    "lang_embedding_format": "clip",
+    "tokenizer": "openai/clip-vit-large-patch14",
+    "lang_tokenizer": "openai/clip-vit-large-patch14",
+    "recalculate_visual_embs": false,
+    "n_ts_per_task": 11,
+    "task_embedding_one_hot_offset": 1,
+    "pretrain": false,
+    "pretrain_model_path": "",
+    "num_gpus": 2,
+    "model_type": "L1",
+    "benchmark_name": "LIBERO_100",
+    "data": {
+        "data_modality": [
+            "image",
+            "proprio"
+        ],
+        "seq_len": 10,
+        "frame_stack": 1,
+        "demos_per_task": 50,
+        "use_eye_in_hand": true,
+        "use_gripper": true,
+        "use_joint": true,
+        "use_ee": false,
+        "max_word_len": 50,
+        "max_instructs": 10,
+        "state_dim": null,
+        "num_kp": 64,
+        "img_h": 128,
+        "img_w": 128,
+        "task_group_size": 1,
+        "task_order_index": 0,
+        "shuffle_task": false,
+        "obs": {
+            "modality": {
+                "rgb": [
+                    "agentview_rgb",
+                    "eye_in_hand_rgb"
+                ],
+                "depth": [],
+                "low_dim": [
+                    "gripper_states",
+                    "joint_states"
+                ]
+            }
+        },
+        "affine_translate": 4,
+        "action_scale": 1.0,
+        "train_dataset_ratio": 0.8
+    },
+    "policy": {
+        "color_aug": {
+            "network": "BatchWiseImgColorJitterAug",
+            "network_kwargs": {
+                "input_shape": null,
+                "brightness": 0.3,
+                "contrast": 0.3,
+                "saturation": 0.3,
+                "hue": 0.3,
+                "epsilon": 0.1
+            }
+        },
+        "translation_aug": {
+            "network": "TranslationAug",
+            "network_kwargs": {
+                "input_shape": [
+                    3,
+                    128,
+                    128
+                ],
+                "translation": 8
+            }
+        },
+        "image_encoder": {
+            "network": "ResnetEncoder",
+            "network_kwargs": {
+                "pretrained": false,
+                "freeze": false,
+                "remove_layer_num": 4,
+                "no_stride": false,
+                "language_fusion": "film",
+                "input_shape": [
+                    3,
+                    128,
+                    128
+                ],
+                "output_size": 64,
+                "language_dim": 64
+            }
+        },
+        "temporal_position_encoding": {
+            "network": "SinusoidalPositionEncoding",
+            "network_kwargs": {
+                "input_size": 64,
+                "inv_freq_factor": 10,
+                "factor_ratio": null
+            }
+        },
+        "decoder": {
+            "network": "TransformerCrossDecoder",
+            "network_kwargs": {
+                "input_size": 64,
+                "output_size": 64,
+                "depth": 4,
+                "num_heads": 8,
+                "mlp_ratio": 4.0,
+                "qkv_bias": true,
+                "qk_scale": null,
+                "drop_rate": 0.1,
+                "attn_drop_rate": 0.1,
+                "perceiver_ct_index": [
+                    0,
+                    1,
+                    2,
+                    3,
+                    4
+                ],
+                "norm_layer": null,
+                "num_action_q": 10,
+                "max_text_q": 25,
+                "max_region_q": 50,
+                "max_frame_q": 32,
+                "max_instruct_q": 10,
+                "query_drop": true,
+                "query_norm": null
+            }
+        },
+        "mlm_head": {
+            "network": "MLMHead",
+            "network_kwargs": {
+                "hidden_size": 1024,
+                "mlm_loss_weight": 0.5,
+                "anneal_factor": 0.1,
+                "anneal_every_n_epochs": 10
+            }
+        },
+        "mim_head": {
+            "network": "MIMHead",
+            "network_kwargs": {
+                "hidden_size": 64,
+                "mlm_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 1
+            }
+        },
+        "mgm_head": {
+            "network": "MGMHead",
+            "network_kwargs": {
+                "hidden_size": 64,
+                "mlm_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 1
+            }
+        },
+        "mfm_head": {
+            "network": "MFMHead_L1",
+            "network_kwargs": {
+                "input_size": 64,
+                "output_size": 768,
+                "mfm_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 1
+            }
+        },
+        "mrm_head": {
+            "network": "MRMHead_L1",
+            "network_kwargs": {
+                "input_size": 64,
+                "output_size": 1024,
+                "mrm_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 1
+            }
+        },
+        "maim_head": {
+            "network": "MAIMHead_L1",
+            "network_kwargs": {
+                "input_size": 64,
+                "output_size": 768,
+                "maim_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 10
+            }
+        },
+        "magm_head": {
+            "network": "MAGMHead_L1",
+            "network_kwargs": {
+                "input_size": 64,
+                "output_size": 768,
+                "magm_loss_weight": 0.5,
+                "anneal_factor": 1.0,
+                "anneal_every_n_epochs": 10
+            }
+        },
+        "policy_head": {
+            "network": "GMMHead",
+            "network_kwargs": {
+                "hidden_size": 1024,
+                "num_layers": 2,
+                "min_std": 0.0001,
+                "num_modes": 5,
+                "low_eval_noise": false,
+                "activation": "softplus",
+                "input_size": 64,
+                "output_size": 7
+            },
+            "loss_kwargs": {
+                "loss_coef": 1.0
+            }
+        },
+        "policy_type": "BCMutexPolicy",
+        "add_mlm": false,
+        "add_mfm": true,
+        "add_mrm": true,
+        "add_mgm": true,
+        "add_mim": true,
+        "add_maim": true,
+        "add_magm": true,
+        "num_task_frames": 16,
+        "slice_model_ind": 23,
+        "task_spec_modalities": "gl_inst_img_vid_ai_ag",
+        "extra_num_layers": 0,
+        "extra_hidden_size": 128,
+        "embed_size": 64,
+        "use_film": false,
+        "add_extra_mlp": true,
+        "add_rep_loss": false,
+        "transformer_input_size": null,
+        "transformer_context_size": null,
+        "transformer_num_layers": 7,
+        "transformer_num_heads": 6,
+        "transformer_head_output_size": 64,
+        "transformer_mlp_hidden_size": 256,
+        "transformer_dropout": 0.1,
+        "transformer_attn_dropout": 0.1,
+        "transformer_cross_attn_ind": [
+            0,
+            2,
+            4,
+            6
+        ],
+        "transformer_max_seq_len": 10,
+        "rep_loss_coef": 0.1,
+        "sg_gt_rep": false,
+        "projection_layer": {
+            "network": "TSEncoder",
+            "network_kwargs": {
+                "input_size": 768,
+                "max_frames": 64,
+                "drop_rate": 0.1,
+                "output_size": 768,
+                "hidden_size": 768,
+                "num_hidden_layers": 0,
+                "vid_transform_kwargs": {
+                    "network": "TemporalPoolTransformer",
+                    "network_kwargs": {
+                        "num_layers": 1,
+                        "num_heads": 4,
+                        "head_output_size": 64,
+                        "mlp_hidden_size": 256,
+                        "dropout": 0.1
+                    }
+                },
+                "inst_transform_kwargs": {
+                    "network": "TemporalPoolTransformer",
+                    "network_kwargs": {
+                        "num_layers": 1,
+                        "num_heads": 4,
+                        "head_output_size": 64,
+                        "mlp_hidden_size": 256,
+                        "dropout": 0.1
+                    }
+                },
+                "ag_transform_kwargs": {
+                    "network": "TemporalPoolTransformer",
+                    "network_kwargs": {
+                        "num_layers": 1,
+                        "num_heads": 4,
+                        "head_output_size": 64,
+                        "mlp_hidden_size": 256,
+                        "dropout": 0.1
+                    }
+                },
+                "ai_transform_kwargs": {
+                    "network": "TemporalPoolTransformer",
+                    "network_kwargs": {
+                        "num_layers": 1,
+                        "num_heads": 4,
+                        "head_output_size": 64,
+                        "mlp_hidden_size": 256,
+                        "dropout": 0.1
+                    }
+                },
+                "gl_transform_kwargs": {
+                    "network": "MLPTransform",
+                    "network_kwargs": {
+                        "num_layers": 2,
+                        "hidden_size": 512
+                    }
+                },
+                "img_transform_kwargs": {
+                    "network": "MLPTransform",
+                    "network_kwargs": {
+                        "num_layers": 2,
+                        "hidden_size": 512
+                    }
+                }
+            }
+        }
+    },
+    "train": {
+        "optimizer": {
+            "name": "torch.optim.AdamW",
+            "kwargs": {
+                "lr": 0.0001,
+                "betas": [
+                    0.9,
+                    0.999
+                ],
+                "weight_decay": 0.0001
+            }
+        },
+        "scheduler": {
+            "name": "torch.optim.lr_scheduler.CosineAnnealingLR",
+            "kwargs": {
+                "eta_min": 1e-05,
+                "last_epoch": -1
+            }
+        },
+        "n_epochs": 50,
+        "batch_size": 64,
+        "num_workers": 8,
+        "grad_clip": 100,
+        "loss_scale": 1.0,
+        "val_every": 5,
+        "resume": false,
+        "resume_path": "",
+        "debug": false,
+        "use_augmentation": true
+    },
+    "eval": {
+        "load_path": "",
+        "eval": false,
+        "batch_size": 64,
+        "num_workers": 4,
+        "n_eval": 20,
+        "eval_every": 5,
+        "max_steps": 600,
+        "use_mp": true,
+        "num_procs": 20,
+        "debug": false,
+        "iou_threshold": 0.5,
+        "visualization": false,
+        "compute_attention": false,
+        "video": false,
+        "save_state": true,
+        "use_spacemouse": false,
+        "video_path": "videos",
+        "criterion": "success"
+    },
+    "lifelong": {
+        "algo": "Multitask"
+    },
+    "shape_meta": {
+        "ac_dim": 7,
+        "all_shapes": {
+            "agentview_rgb": [
+                3,
+                128,
+                128
+            ],
+            "eye_in_hand_rgb": [
+                3,
+                128,
+                128
+            ],
+            "gripper_states": [
+                2
+            ],
+            "joint_states": [
+                7
+            ]
+        },
+        "all_obs_keys": [
+            "agentview_rgb",
+            "eye_in_hand_rgb",
+            "gripper_states",
+            "joint_states"
+        ],
+        "use_images": true
+    },
+    "experiment_dir": "/data/experiments/ts_transforms/gl_inst_img_vid_ai_ag_model_typeL1_LIBERO_100_d50_ts_transforms_extra_mlp_aws/run_001",
+    "experiment_name": "experiments_ts_transforms_gl_inst_img_vid_ai_ag_model_typeL1_LIBERO_100_d50_ts_transforms_extra_mlp_aws_run_001"
+}
